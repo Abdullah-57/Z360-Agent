@@ -535,10 +535,13 @@ Double-check on GitHub that `.env` is **NOT** there (your `.gitignore` should ha
 > Next.js + Tailwind + shadcn frontend on Vercel (section 4). FastAPI Cloud just
 > gives that frontend a live `/screen` endpoint to call.
 
-> **Note on `app.py`:** the `app.py` file you created earlier was a Hugging Face
-> workaround (it mounted FastAPI onto Gradio). FastAPI Cloud doesn't need it — it
-> deploys `server.py` directly. You can leave `app.py` in the repo (harmless) or
-> delete it. Either way it isn't used here.
+> **Entrypoint (`main.py`):** FastAPI Cloud's launcher auto-discovers your app by
+> looking for `main.py` (then `app.py`) and running the first FastAPI instance it
+> finds. Your real app lives in `server.py` and stays **unchanged**, so we add a
+> tiny `main.py` that just re-exports it — `from server import app`. That's the
+> conventional entrypoint the platform expects, so no `--app` flag or config is
+> needed. (The old Hugging Face `app.py` and `Dockerfile` were deleted — they were
+> Gradio/HF-only leftovers that would confuse the launcher.)
 
 **How FastAPI Cloud works:** you install its command-line tool, log in (it opens
 your browser to authenticate — no card), and run one deploy command from inside
@@ -583,14 +586,9 @@ folder, with your virtual environment activated:
    fastapi deploy
    ```
 
-   The CLI detects your FastAPI app, installs `requirements.txt`, builds, and
-   deploys. When it finishes it prints your live URL (something like
+   The CLI detects your FastAPI app (via `main.py`), installs `requirements.txt`,
+   builds, and deploys. When it finishes it prints your live URL (something like
    `https://z360-agent-XXXX.fastapicloud.app`).
-
-   > **If it can't find your app:** FastAPI Cloud looks for the app in `main.py` or
-   > `app.py` by default, but yours is in `server.py`. If the deploy asks which app
-   > to use, point it at `server:app` (module `server`, variable `app`). Check
-   > `fastapi deploy --help` for the exact flag — it's typically an `--app` option.
 
 5. **Confirm the backend is live:**
    - Open `https://<your-fastapi-cloud-url>/health` → should return `{"ok": true}`.
