@@ -4,8 +4,9 @@
 # pinned unused Gradio + Google packages (google-api-core / grpcio-status /
 # google-ai-generativelanguage) whose pins were mutually unsatisfiable on a
 # clean build — none of them are imported by this app, so they're gone.
-fastapi==0.141.1
-uvicorn==0.52.0
+# fastapi[standard] (not bare fastapi) bundles the `fastapi run` CLI and
+# uvicorn[standard] that FastAPI Cloud uses to launch the app.
+fastapi[standard]==0.141.1
 pydantic==2.13.4
 python-dotenv==1.2.2
 groq==0.37.1

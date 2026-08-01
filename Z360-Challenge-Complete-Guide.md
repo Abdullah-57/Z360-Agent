@@ -165,8 +165,7 @@ Instead, list only what the app actually imports and let the installer resolve
 the rest. Create `requirements.txt` with exactly this:
 
 ```
-fastapi==0.141.1
-uvicorn==0.52.0
+fastapi[standard]==0.141.1
 pydantic==2.13.4
 python-dotenv==1.2.2
 groq==0.37.1
@@ -176,6 +175,10 @@ langchain-core==1.5.2
 langgraph==1.2.10
 supabase==2.31.0
 ```
+
+(Use `fastapi[standard]`, not bare `fastapi` — the `[standard]` extra ships the
+`fastapi run` CLI and `uvicorn[standard]` that FastAPI Cloud uses to start your
+app. Plain `fastapi` installs but won't launch on the platform.)
 
 ### 3.2 Create a `.env` file (your secrets, kept off GitHub)
 
