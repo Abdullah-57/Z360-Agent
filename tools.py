@@ -11,21 +11,29 @@ supabase = create_client(
 )
 
 def _resolve_job_id(job_id: str) -> str:
-    """Return a valid job_descriptions UUID, self-healing a bad one.
+    """Return a job_descriptions id that actually EXISTS, self-healing a bad one.
 
     The id/job_id columns are Postgres `uuid`. The LLM is told to reuse the exact
-    id returned by save_job_description, but models sometimes pass a placeholder
-    like "1" instead of the real UUID. That makes Postgres reject the write with
-    `invalid input syntax for type uuid`. Rather than fail the whole screening
-    over the model's bookkeeping slip, we validate the id here: if it's already a
-    well-formed UUID we trust it; if not, we fall back to the most recently saved
-    job description (the one the agent almost certainly just created in this same
-    run). Raises a clear error only if there is no job to fall back to."""
+    id returned by save_job_description, but models fail this two ways:
+      1. they pass a placeholder like "1"  -> not even a valid UUID (Postgres
+         rejects the write with `invalid input syntax for type uuid`);
+      2. they pass a well-formed but MADE-UP uuid that was never saved -> the
+         foreign key check fails (`... is not present in table job_descriptions`).
+    Checking the format alone misses case 2, so we verify the id actually exists.
+    If it doesn't (either case), we fall back to the most recently saved job
+    description -- the one the agent almost certainly just created in this same
+    run. Raises a clear error only if there is no job to fall back to."""
     try:
-        uuid.UUID(str(job_id))
-        return job_id  # already a valid UUID — use as-is
+        uuid.UUID(str(job_id))                       # well-formed UUID?
+        found = (supabase.table("job_descriptions")
+                 .select("id")
+                 .eq("id", job_id)
+                 .execute())
+        if found.data:
+            return job_id                            # real, existing id — use it
     except (ValueError, AttributeError, TypeError):
-        pass
+        pass                                         # malformed uuid -> fall back
+
     recent = (supabase.table("job_descriptions")
               .select("id")
               .order("created_at", desc=True)
@@ -34,9 +42,9 @@ def _resolve_job_id(job_id: str) -> str:
     if recent.data:
         return recent.data[0]["id"]
     raise ValueError(
-        f"job_id {job_id!r} is not a valid UUID and no saved job description "
-        "exists to fall back to. Call save_job_description first and reuse the "
-        "id it returns."
+        f"job_id {job_id!r} does not exist and no saved job description exists "
+        "to fall back to. Call save_job_description first and reuse the id it "
+        "returns."
     )
 
 # The hiring company this agent screens for. Used to sign outreach emails so
