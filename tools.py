@@ -1,5 +1,5 @@
 # tools.py
-import os, json
+import os, json, uuid
 from typing import Union
 from supabase import create_client
 from langchain_core.tools import tool
@@ -9,6 +9,35 @@ supabase = create_client(
     os.environ["SUPABASE_URL"],
     os.environ["SUPABASE_SERVICE_KEY"],
 )
+
+def _resolve_job_id(job_id: str) -> str:
+    """Return a valid job_descriptions UUID, self-healing a bad one.
+
+    The id/job_id columns are Postgres `uuid`. The LLM is told to reuse the exact
+    id returned by save_job_description, but models sometimes pass a placeholder
+    like "1" instead of the real UUID. That makes Postgres reject the write with
+    `invalid input syntax for type uuid`. Rather than fail the whole screening
+    over the model's bookkeeping slip, we validate the id here: if it's already a
+    well-formed UUID we trust it; if not, we fall back to the most recently saved
+    job description (the one the agent almost certainly just created in this same
+    run). Raises a clear error only if there is no job to fall back to."""
+    try:
+        uuid.UUID(str(job_id))
+        return job_id  # already a valid UUID — use as-is
+    except (ValueError, AttributeError, TypeError):
+        pass
+    recent = (supabase.table("job_descriptions")
+              .select("id")
+              .order("created_at", desc=True)
+              .limit(1)
+              .execute())
+    if recent.data:
+        return recent.data[0]["id"]
+    raise ValueError(
+        f"job_id {job_id!r} is not a valid UUID and no saved job description "
+        "exists to fall back to. Call save_job_description first and reuse the "
+        "id it returns."
+    )
 
 # The hiring company this agent screens for. Used to sign outreach emails so
 # they never go out with a "[Your Name]" placeholder. Configurable via env var
@@ -73,6 +102,11 @@ def save_candidate_result(job_id: str, name: str, resume_text: str,
     This keeps a retried/replayed agent step from creating multiple rows.
     NOTE: matching on name is fine for a demo; in production you'd match on a
     stable identifier (email or candidate id) to avoid same-name collisions."""
+    # Guard the foreign key: if the model handed us a placeholder instead of the
+    # real UUID from save_job_description, resolve it (see _resolve_job_id) so a
+    # good screening isn't lost to a bad id.
+    job_id = _resolve_job_id(job_id)
+
     # LLMs often serialize numbers as strings (e.g. "90" instead of 90). We
     # accept either and coerce to int here so a well-reasoned screening isn't
     # thrown away over a JSON type mismatch. int() also strips a stray "90.0".
@@ -115,6 +149,8 @@ def save_candidate_result(job_id: str, name: str, resume_text: str,
 def list_pipeline(job_id: str) -> str:
     """Return all screened candidates for a job, ranked by score (highest
     first), as a JSON string. Use this to summarize the hiring pipeline."""
+    # Same UUID guard as save_candidate_result: tolerate a placeholder job_id.
+    job_id = _resolve_job_id(job_id)
     res = (supabase.table("candidates")
            .select("name,score,recommendation")
            .eq("job_id", job_id)
