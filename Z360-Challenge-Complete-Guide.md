@@ -31,7 +31,7 @@ The clever part (what makes it a "Deep Agent" and not a chatbot) is that the AI 
                │  HTTP (JSON)                          ▲
                ▼                                       │ writes results
    ┌─────────────────────────────────────┐            │
-   │  Agent server (Python, on HF Space)  │────────────┘
+   │  Agent server (Python, FastAPI Cloud) │────────────┘
    │  - FastAPI web wrapper               │
    │  - LangGraph "Deep Agent" (deepagents)│
    │  - custom tools + domain knowledge   │
@@ -40,7 +40,7 @@ The clever part (what makes it a "Deep Agent" and not a chatbot) is that the AI 
 
 Three deployed pieces:
 - **Frontend** = the website the recruiter sees. Built with Next.js + Tailwind + shadcn, deployed to **Vercel** (free).
-- **Agent server** = a small Python program that holds the AI agent. Deployed to **Hugging Face Spaces** (free tier). We use Python because LangChain's official *Deep Agents* harness (`deepagents`) is Python-first, and the challenge's own scoring table treats the "agent server" as its own component.
+- **Agent server** = a small Python program that holds the AI agent. Deployed to **FastAPI Cloud** (free Hobby tier). We use Python because LangChain's official *Deep Agents* harness (`deepagents`) is Python-first, and the challenge's own scoring table treats the "agent server" as its own component.
 - **Supabase** = the database in the cloud that remembers everything (free tier).
 
 Don't worry if this feels like a lot. We do it one piece at a time, and each piece is testable on its own before we connect them.
@@ -57,10 +57,10 @@ Create these accounts before writing any code. Use the **same email** (ideally a
 
 | Thing | What it's for | Link |
 |---|---|---|
-| **GitHub** | stores your code; Vercel & HF deploy from it | github.com |
+| **GitHub** | stores your code; Vercel deploys from it | github.com |
 | **Supabase** | cloud database | supabase.com |
 | **Vercel** | hosts the frontend website | vercel.com |
-| **Hugging Face** | hosts the Python agent server | huggingface.co |
+| **FastAPI Cloud** | hosts the Python agent server | fastapicloud.com |
 | **Groq** | the LLM brain of the agent — free tier, **no credit card**, works everywhere | console.groq.com |
 | **Tavily** (optional) | lets the agent do web lookups; free tier | tavily.com |
 
@@ -126,7 +126,7 @@ create table candidates (
    - **Project URL** (looks like `https://abcdxyz.supabase.co`)
    - **`service_role` secret key** (a long string). The agent server uses this to write results.
 
-> Security note for the interview: the `service_role` key bypasses row-level security, so it must live **only** on the server (Hugging Face Space Secrets), never in the frontend. The frontend never talks to the database directly in this design — it goes through the agent server. This keeps the key safe and is a deliberate architecture choice worth mentioning.
+> Security note for the interview: the `service_role` key bypasses row-level security, so it must live **only** on the server (FastAPI Cloud secrets/environment variables), never in the frontend. The frontend never talks to the database directly in this design — it goes through the agent server. This keeps the key safe and is a deliberate architecture choice worth mentioning.
 
 > About "RLS": Supabase may warn that Row Level Security is disabled on your tables. For a weekend demo using only the server-side `service_role` key that's fine — but *say out loud in your video* that in production you'd enable RLS and add auth. Naming the tradeoff scores "engineering ownership" points.
 
@@ -156,10 +156,25 @@ You'll see `(venv)` appear at the start of your terminal line. Now install the l
 pip install deepagents langchain langchain-groq fastapi "uvicorn[standard]" supabase python-dotenv pydantic
 ```
 
-Then save the exact versions (Hugging Face Spaces needs this file to rebuild your server):
+Then create a `requirements.txt` (FastAPI Cloud reads this file to build your
+server). **Do NOT use `pip freeze`** — that dumps every package in your venv,
+including unused leftovers from earlier experiments, and their transitive pins
+can conflict on a clean cloud build (this bit us once: a leftover Google/Gradio
+package pinned `grpcio-status` in a way the cloud resolver couldn't satisfy).
+Instead, list only what the app actually imports and let the installer resolve
+the rest. Create `requirements.txt` with exactly this:
 
-```bash
-pip freeze > requirements.txt
+```
+fastapi==0.141.1
+uvicorn==0.52.0
+pydantic==2.13.4
+python-dotenv==1.2.2
+groq==0.37.1
+deepagents==0.7.0
+langchain-groq==1.1.3
+langchain-core==1.5.2
+langgraph==1.2.10
+supabase==2.31.0
 ```
 
 ### 3.2 Create a `.env` file (your secrets, kept off GitHub)
@@ -501,202 +516,98 @@ git push -u origin main
 
 Double-check on GitHub that `.env` is **NOT** there (your `.gitignore` should have excluded it). If you see it, delete it from the repo immediately and rotate your keys.
 
-### 3.8 Deploy the agent to Hugging Face Spaces (free, no card)
+### 3.8 Deploy the agent to FastAPI Cloud (free, no card)
 
-> Why Hugging Face and not Render? Render's free web services now require a
-> credit card on file. Hugging Face Spaces is genuinely free with **no card
-> required**, gives you a public URL, and has a proper Secrets panel for your env
-> vars. Bonus: hosting an AI agent on Hugging Face is a nice talking point in an
-> AI-focused interview.
+> **Why FastAPI Cloud?** The free-hosting landscape got rough in 2026: Render now
+> asks for a credit card even on its free plan, Hugging Face's free CPU tier now
+> requires paid PRO to run a Space, and Koyeb closed its free tier to new signups
+> after being acquired by Mistral AI. **FastAPI Cloud** is the official cloud
+> platform built by the FastAPI team itself. Its **Hobby plan is free with no
+> credit card** (3 apps, custom domain), and because it's purpose-built for
+> FastAPI, it deploys your **unchanged `server.py`** with a single command — no
+> Dockerfile, no wrapper, no config files. `server.py`, `agent.py`, and `tools.py`
+> all deploy exactly as they are.
 >
-> **This Space hosts your backend, not your frontend.** The task requires a real
-> Next.js + Tailwind + shadcn frontend on Vercel (section 4) — a Gradio UI does
-> **not** satisfy that. So we use this free Space purely as a home for your
-> **unchanged FastAPI backend**, so the Vercel frontend has a live `/screen`
-> endpoint to call.
->
-> **The catch, and the trick:** on the free tier HF's **Docker** SDK is now paid —
-> only the **Gradio** and **Static** SDKs are free. Raw `uvicorn server:app`
-> needs Docker, so we can't run it directly. But Gradio runs on Starlette (the
-> same base FastAPI is built on), so we can **mount your existing FastAPI app onto
-> the Gradio server**. The result: the free Gradio Space serves your real JSON API
-> at the root (`/health`, `/screen`) *and* a tiny built-in debug UI at `/ui`.
-> Nothing in `server.py`, `agent.py`, or `tools.py` changes — we add exactly one
-> new file, `app.py`, that imports them as-is.
+> **This host serves your backend, not your frontend.** The task requires a real
+> Next.js + Tailwind + shadcn frontend on Vercel (section 4). FastAPI Cloud just
+> gives that frontend a live `/screen` endpoint to call.
 
-**`app.py`** (already created for you) — mounts your unchanged FastAPI app onto
-Gradio so HF's free Gradio SDK will run it. It keeps `/health` and `/screen` at
-the root (where your Vercel frontend will call them) and adds a small debug UI at
-`/ui`:
+> **Note on `app.py`:** the `app.py` file you created earlier was a Hugging Face
+> workaround (it mounted FastAPI onto Gradio). FastAPI Cloud doesn't need it — it
+> deploys `server.py` directly. You can leave `app.py` in the repo (harmless) or
+> delete it. Either way it isn't used here.
 
-```python
-# app.py — Hugging Face Spaces entrypoint (free Gradio SDK).
-#
-# The task requires a Next.js/Vercel frontend that calls the agent's FastAPI
-# endpoints (/screen, /health) over HTTP. Those endpoints live in server.py and
-# are UNCHANGED. Free hosts that run raw uvicorn now want a card, and HF's Docker
-# SDK is paid — only HF's *Gradio* SDK is free. Gradio runs on Starlette (same
-# base as FastAPI), so we MOUNT our existing FastAPI app onto the Gradio server.
-# The free Gradio Space then serves BOTH the real JSON API (at the root) and a
-# small debug UI (at /ui). server.py, agent.py, tools.py are all imported as-is.
-import os
-from dotenv import load_dotenv
-load_dotenv()  # local .env; on HF Spaces the Secrets are injected as env vars
+**How FastAPI Cloud works:** you install its command-line tool, log in (it opens
+your browser to authenticate — no card), and run one deploy command from inside
+your project folder. It reads your `requirements.txt`, builds your app, and gives
+you a live HTTPS URL.
 
-import gradio as gr
+Now deploy. Do all of this in **Windows PowerShell**, from inside your `z360-agent`
+folder, with your virtual environment activated:
 
-# Import the EXISTING FastAPI app (with /health and /screen) unchanged, plus the
-# same agent it uses so the debug UI runs the identical screening path.
-from server import app as fastapi_app
-from agent import agent
-from groq import RateLimitError
-from langgraph.errors import GraphRecursionError
+1. **Install the FastAPI Cloud CLI:**
 
+   ```powershell
+   pip install fastapi-cloud-cli
+   ```
 
-def _run_agent(message: str) -> str:
-    """Debug-UI helper: same invoke + error handling as server.py's /screen,
-    returned as text. Only for the optional Gradio UI at /ui; the real frontend
-    uses the JSON /screen endpoint from server.py."""
-    if not message or not message.strip():
-        return "Please enter a job description and/or a candidate resume to screen."
-    try:
-        result = agent.invoke(
-            {"messages": [{"role": "user", "content": message}]},
-            config={"recursion_limit": 15},
-        )
-    except RateLimitError as e:
-        groq_msg = getattr(e, "message", None) or str(e)
-        return f"⚠️ Groq rate limit hit — {groq_msg}"
-    except GraphRecursionError:
-        return ("⚠️ The agent hit the step limit without finishing "
-                "(looped). Try rephrasing or a more capable model.")
-    except Exception as e:
-        return f"⚠️ Agent error: {e}"
-    return result["messages"][-1].content
+2. **Log in** (opens a browser window to authenticate your account — sign up here,
+   free, no card):
 
+   ```powershell
+   fastapi login
+   ```
 
-with gr.Blocks(title="Z360 Candidate Screening Agent — debug UI") as demo:
-    gr.Markdown(
-        "# 🤖 Candidate Screening Deep Agent — debug UI\n"
-        "This is a lightweight built-in UI for sanity-checking the agent. The "
-        "real product frontend is the Next.js app on Vercel, which calls this "
-        "same service's `POST /screen` JSON endpoint."
-    )
-    inp = gr.Textbox(label="Instruction (JD + resume, or 'show the pipeline')",
-                     lines=10)
-    btn = gr.Button("Screen", variant="primary")
-    out = gr.Markdown(label="Result")
-    btn.click(fn=_run_agent, inputs=inp, outputs=out)
+3. **Set your environment variables as secrets.** Your app needs the same three
+   keys and `COMPANY_NAME` that are in your local `.env`. FastAPI Cloud injects
+   secrets as environment variables at runtime, so `server.py` reads them exactly
+   like it reads your local `.env`. Set each one (the CLI will prompt for the value,
+   or check `fastapi deploy --help` for the exact secret syntax your installed
+   version uses):
 
-# Mount the Gradio debug UI onto the FastAPI app at /ui, then expose the FastAPI
-# app as the ASGI application HF runs. This keeps /health and /screen at the root
-# (where the frontend expects them) and puts the optional UI at /ui.
-app = gr.mount_gradio_app(fastapi_app, demo, path="/ui")
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 7860)))
-```
-
-**`README.md`** — Spaces reads the YAML header at the top to configure the Space.
-For the Gradio SDK it must say `sdk: gradio` and point at `app.py`:
-
-```markdown
----
-title: Z360 Candidate Screening Agent
-emoji: 🤖
-colorFrom: blue
-colorTo: indigo
-sdk: gradio
-app_file: app.py
-pinned: false
----
-```
-
-**`requirements.txt`** — make sure `gradio` is listed (see step 3.8a below).
-
-Now deploy:
-
-1. Go to **huggingface.co** → sign up (free, **no card**) → verify your email.
-2. Click your avatar → **New Space**. Fill in:
-   - **Owner:** your username
-   - **Space name:** `z360-agent`
-   - **License:** MIT (fine for a demo)
-   - **Space SDK:** **Gradio** → choose the **Blank** template
-   - **Hardware:** **CPU basic** (free)
-   - **Visibility:** Public
-   Click **Create Space**. This gives you an empty Space with its own git repo.
-3. Add your secrets: on the Space page → **Settings** → **Variables and secrets**
-   → **New secret**, and add each of these (values copied from your local `.env`):
    - `GROQ_API_KEY`
    - `SUPABASE_URL`
    - `SUPABASE_SERVICE_KEY`
    - `COMPANY_NAME` → `Zikra Infotech` (optional; the code defaults to this)
 
-   > Use **Secret**, not public **Variable**, for the three keys — secrets are
-   > hidden and injected as env vars at runtime, never shown in the repo. This is
-   > the Hugging Face equivalent of your `.env`, keeping keys off the public repo.
+   > These stay server-side and never touch the frontend or the public repo — the
+   > same rule as your local `.env`. The Supabase **service** key in particular must
+   > live only here, never in the Next.js app.
 
-4. Push your code to the Space. The Space is a second git remote (separate from
-   GitHub). From inside your `z360-agent` folder:
+4. **Deploy:**
 
-   ```bash
-   git remote add space https://huggingface.co/spaces/YOUR-USERNAME/z360-agent
-   git push space main
+   ```powershell
+   fastapi deploy
    ```
 
-   When Git asks for a password, paste a **Hugging Face access token** (not your
-   account password): huggingface.co → Settings → **Access Tokens** → **New
-   token** → role **Write** → copy it and use it as the password. Username is
-   your HF username.
+   The CLI detects your FastAPI app, installs `requirements.txt`, builds, and
+   deploys. When it finishes it prints your live URL (something like
+   `https://z360-agent-XXXX.fastapicloud.app`).
 
-   > This keeps GitHub as your primary remote (`origin`) AND deploys to Spaces
-   > (`space`). To update later, `git push origin main` then `git push space main`.
+   > **If it can't find your app:** FastAPI Cloud looks for the app in `main.py` or
+   > `app.py` by default, but yours is in `server.py`. If the deploy asks which app
+   > to use, point it at `server:app` (module `server`, variable `app`). Check
+   > `fastapi deploy --help` for the exact flag — it's typically an `--app` option.
 
-5. Watch the **Building** logs on the Space page. First build takes a few minutes
-   (it installs all of `requirements.txt`). When it finishes, the status turns to
-   **Running**.
-6. Your service URL is `https://YOUR-USERNAME-z360-agent.hf.space`. Confirm the
-   backend is live by checking three things:
-   - Open `https://YOUR-USERNAME-z360-agent.hf.space/health` → should return
-     `{"ok": true}`. This is the endpoint your Vercel frontend will call.
-   - Open `https://YOUR-USERNAME-z360-agent.hf.space/ui` → the small debug UI.
-     Paste the example JD + resume, click **Screen**, and confirm a result comes
-     back and a row appears in your Supabase **candidates** table.
-   - This `hf.space` URL is your **backend base URL** — you'll point the Next.js
-     frontend at it in section 4. It is **not** your submission link; the
-     submission link is the **Vercel** URL from section 4.
+5. **Confirm the backend is live:**
+   - Open `https://<your-fastapi-cloud-url>/health` → should return `{"ok": true}`.
+     This is the endpoint your Vercel frontend will call.
+   - This URL is your **backend base URL** — you'll point the Next.js frontend at it
+     in section 4. It is **not** your submission link; the submission link is the
+     **Vercel** URL from section 4.
 
-> Heads-up about the free tier: a free Space "sleeps" after ~48 hours of
-> inactivity and takes ~30s to wake on the first request after that. Fine for a
-> demo. Mention it in your written note as a known limitation with an easy fix
-> (paid hardware / keep-alive ping).
+   > You can also test a real screening now with a quick curl (only if your Groq
+   > daily token limit hasn't been exhausted):
+   > ```powershell
+   > curl -X POST https://<your-fastapi-cloud-url>/screen -H "Content-Type: application/json" -d "{\"message\": \"Job: Backend Engineer. Must have Python, FastAPI, PostgreSQL. Please save this job description.\"}"
+   > ```
 
-> If the build fails: open the **Logs** tab on the Space and read the last red
-> lines. The usual culprits are a typo in a secret name, or a missing package in
-> `requirements.txt` — paste the error and debug from there.
+> To redeploy later after code changes, just run `fastapi deploy` again from the
+> project folder.
 
-#### 3.8a Add `gradio` to requirements.txt
-
-Your `requirements.txt` is fully pinned, so add gradio and let pip resolve a
-compatible version. In your **local** venv (Windows PowerShell), from inside
-`z360-agent` with the venv activated:
-
-```powershell
-pip install gradio
-pip freeze > requirements.txt
-```
-
-Then confirm the app runs locally before pushing:
-
-```powershell
-python app.py
-```
-
-Open the local URL it prints (usually `http://localhost:7860`), paste the example
-JD + resume, and confirm you get a result. If it works locally, it will build on
-Spaces. Commit the updated `requirements.txt`, `app.py`, and `README.md`, then
-push to both remotes (`git push origin main` and `git push space main`).
+> If the deploy or health check fails: read the CLI's output — the usual culprits
+> are a missing/mis-typed secret (e.g. `GROQ_API_KEY`), or the app not being found
+> (point it at `server:app` as in step 4). Paste the error and debug from there.
 
 ---
 
@@ -705,8 +616,8 @@ push to both remotes (`git push origin main` and `git push space main`).
 > **This is a required part of the task.** The challenge explicitly asks for a
 > Next.js + Tailwind + shadcn frontend deployed to a **live Vercel link**, and
 > that Vercel URL is your submission link. The good news: the hard part is done.
-> Your backend is already live on Hugging Face from section 3.8, serving the JSON
-> API at `https://YOUR-USERNAME-z360-agent.hf.space/screen`. This frontend is a
+> Your backend is already live on FastAPI Cloud from section 3.8, serving the JSON
+> API at `https://<your-fastapi-cloud-url>/screen`. This frontend is a
 > separate, small Next.js app that calls that endpoint over HTTP — no backend work
 > left, just the UI.
 
@@ -750,10 +661,10 @@ npx shadcn@latest add button textarea card input badge tabs
 Create a file `.env.local` in `z360-frontend`:
 
 ```
-NEXT_PUBLIC_AGENT_URL=https://YOUR-USERNAME-z360-agent.hf.space
+NEXT_PUBLIC_AGENT_URL=https://<your-fastapi-cloud-url>
 ```
 
-Use *your* Hugging Face Space URL from step 3.8, with no trailing slash. `NEXT_PUBLIC_` makes it readable in the browser (this URL isn't secret; your keys stay in the Space Secrets, server-side).
+Use *your* FastAPI Cloud service URL from step 3.8, with no trailing slash. `NEXT_PUBLIC_` makes it readable in the browser (this URL isn't secret; your keys stay in the FastAPI Cloud secrets, server-side).
 
 ### 4.4 Build the screening page
 
@@ -845,9 +756,9 @@ export default function Home() {
 npm run dev
 ```
 
-Open `http://localhost:3000`. Paste a short JD and a resume, click **Screen candidate**. If your Hugging Face Space is awake, you'll get a scored result back in a few seconds. Check Supabase — a new candidate row should appear.
+Open `http://localhost:3000`. Paste a short JD and a resume, click **Screen candidate**. If your FastAPI Cloud service is up, you'll get a scored result back in a few seconds. Check Supabase — a new candidate row should appear.
 
-> If nothing happens: open the browser console (F12 → Console) for errors. The usual causes are a wrong `NEXT_PUBLIC_AGENT_URL` (trailing slash, typo) or the Space still asleep (wait ~30s and retry).
+> If nothing happens: open the browser console (F12 → Console) for errors. The usual causes are a wrong `NEXT_PUBLIC_AGENT_URL` (trailing slash, typo) or the backend still waking from a cold start (wait ~30s and retry).
 
 ### 4.6 Deploy the frontend to Vercel
 
@@ -864,7 +775,7 @@ git push -u origin main
 
 2. Go to vercel.com → sign in with GitHub → **Add New → Project** → import `z360-frontend`.
 3. Before deploying, expand **Environment Variables** and add:
-   - Name: `NEXT_PUBLIC_AGENT_URL`  Value: your Hugging Face Space URL (e.g. `https://YOUR-USERNAME-z360-agent.hf.space`)
+   - Name: `NEXT_PUBLIC_AGENT_URL`  Value: your FastAPI Cloud service URL (e.g. `https://z360-agent-XXXX.fastapicloud.app`)
 4. Click **Deploy**. After ~1 minute you get a live URL like `https://z360-frontend.vercel.app`.
 5. Open it and run one real screening end to end. **This URL is what you submit.**
 
@@ -899,9 +810,9 @@ Follow this exact structure and timing — reviewers scan for these beats:
 - **0:00–0:30 — The problem.** "Recruiters waste hours manually screening resumes against a JD, and it's inconsistent and biased. I built a Candidate Screening Deep Agent that does it in seconds with an auditable rubric."
 - **0:30–2:00 — Live demo.** Open your Vercel URL. Paste a real JD. Screen two contrasting candidates (one strong, one weak). Read out the score, the evidence-based reasoning, and the drafted outreach for the strong one. Then show the ranked pipeline view.
 - **2:00–3:30 — Harness design.** Show `agent.py` and `tools.py` in your editor. Explain: "It's a LangGraph deep agent from the `deepagents` library. It has domain knowledge — this scoring rubric — and three custom tools that parse the JD, persist scored candidates to Supabase, and rank the pipeline. The system prompt enforces a fixed workflow, so it's a real harness, not a chatbot." Show a row appearing in Supabase.
-- **3:30–4:30 — Architecture & tradeoffs.** Show the diagram (from section 0). "Frontend on Vercel, Python agent on a Hugging Face Space, Supabase for persistence. I kept the DB key server-side only. Known limitations: free-tier cold starts, no auth/RLS yet. With more time I'd add authentication, RLS, and multi-role pipelines."
+- **3:30–4:30 — Architecture & tradeoffs.** Show the diagram (from section 0). "Frontend on Vercel, Python agent on FastAPI Cloud, Supabase for persistence. I kept the DB key server-side only. Known limitations: free-tier cold starts, no auth/RLS yet. With more time I'd add authentication, RLS, and multi-role pipelines."
 
-Speak clearly, keep it moving, and make sure the live product is actually working before you hit record (wake the Hugging Face Space first).
+Speak clearly, keep it moving, and make sure the live product is actually working before you hit record (wake the backend first by hitting `/health`).
 
 ---
 
@@ -932,8 +843,8 @@ A LangGraph Deep Agent (LangChain `deepagents`) with:
 The agent plans and calls tools autonomously rather than just replying in text.
 
 ## Architecture
-Next.js + Tailwind + shadcn on Vercel → FastAPI + deepagents on a Hugging Face
-Space → Supabase (Postgres) for persistence. DB service key lives only on the server.
+Next.js + Tailwind + shadcn on Vercel → FastAPI + deepagents on FastAPI Cloud →
+Supabase (Postgres) for persistence. DB service key lives only on the server.
 
 ## What it does well / scope
 One workflow — screening against a single JD — done end to end. Scoped tightly
@@ -947,7 +858,7 @@ Auth + Supabase RLS; multi-role pipelines; resume PDF parsing; interview-questio
 generation per candidate; eval set to measure scoring consistency.
 
 ## Known limitations
-Render free tier cold starts (~30s on HF); no auth yet; single-JD at a time.
+Free-tier cold starts (first request after idle); no auth yet; single-JD at a time.
 ```
 
 Be honest about time and limitations — the reviewers explicitly value candidates who can explain tradeoffs and next steps.
@@ -989,9 +900,9 @@ Abdullah Daoud
 - [ ] Both GitHub repos are public (or shared) and contain no secrets / no `.env`
 - [ ] Demo video is 3–5 min, link viewable by anyone
 - [ ] Written note covers: problem, harness design, what it does, time taken, what's next
-- [ ] Hugging Face Space secrets set; `/health` returns ok
+- [ ] FastAPI Cloud secrets set; `/health` returns ok
 - [ ] Supabase tables receive rows when you screen
-- [ ] You woke the Hugging Face Space right before recording and right before submitting
+- [ ] You woke the backend right before recording and right before submitting
 
 ---
 
@@ -1057,10 +968,10 @@ They will ask about your decisions. Have crisp answers ready:
 
 ## Quick reference: the whole thing in order
 
-1. Create accounts (GitHub, Supabase, Vercel, Hugging Face, Groq). Install Node, Python, Git, VS Code.
+1. Create accounts (GitHub, Supabase, Vercel, FastAPI Cloud, Groq). Install Node, Python, Git, VS Code.
 2. Supabase: new project → run the SQL → copy URL + service key.
 3. Agent: `z360-agent` folder → venv → install libs → `.env` → `tools.py`, `agent.py`, `server.py` → test locally.
-4. Push agent to GitHub → deploy to a Hugging Face Space (mount FastAPI on Gradio SDK) with secrets → test `/health`.
+4. Push agent to GitHub → deploy to FastAPI Cloud (`fastapi deploy`) with secrets → test `/health`.
 5. Frontend: `create-next-app` → shadcn init + components → `.env.local` → `page.tsx` → test locally.
 6. Push frontend to GitHub → deploy to Vercel with `NEXT_PUBLIC_AGENT_URL` → test live.
 7. (Optional) Add pipeline view + one polish feature.
