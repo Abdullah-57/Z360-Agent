@@ -10,13 +10,19 @@ from tools import (screen_candidate, list_pipeline,
 
 # The LLM "brain". Both models below are free on Groq (no credit card).
 #
-# WHY llama-3.3-70b-versatile and NOT the smaller 8b-instant:
-# The deep-agent harness (planning tool, virtual filesystem, sub-agents, long
-# system prompt) needs a capable model to reason its way to a STOP condition.
-# The 8b model was too weak: it looped, re-calling tools without ever finishing,
-# and hit the graph recursion limit (~25 steps, minutes long). Counterintuitively
-# the loop made 8b burn ~15x MORE tokens than one clean 70b run -- so the bigger
-# model is both more reliable AND more token-efficient for this workload.
+# MODEL CHOICE — llama-3.1-8b-instant vs llama-3.3-70b-versatile:
+# Earlier this agent used two save tools and made the model thread a Postgres
+# uuid between them. That chaining was hard for a small model, so we ran on the
+# 70b model. Once the two tools were merged into ONE atomic screen_candidate
+# (the job id is now created and linked in Python — the model never handles it),
+# the model's job got much simpler: extract fields, score, and make a single
+# tool call. The 8b model handles that reliably, and — importantly for a free
+# account — it draws on a SEPARATE, larger daily token budget than the 70b model,
+# so it keeps working when the 70b daily cap is exhausted.
+#
+# To switch back to the higher-quality 70b (e.g. to record a polished demo when
+# its daily budget is fresh), just change the model string below to
+# "llama-3.3-70b-versatile". Nothing else needs to change.
 #
 # max_retries=1  -> when the per-minute token bucket is drained, fail fast with a
 #                   clear error instead of a long internal backoff.
@@ -24,7 +30,7 @@ from tools import (screen_candidate, list_pipeline,
 # Idempotency in screen_candidate (see tools.py) makes any retry safe:
 # a replayed run updates the existing rows, never inserts a duplicate.
 model = ChatGroq(
-    model="llama-3.3-70b-versatile",
+    model="llama-3.1-8b-instant",
     temperature=0,
     max_retries=1,
     request_timeout=30,

@@ -385,13 +385,19 @@ from tools import (screen_candidate, list_pipeline,
 
 # The LLM "brain". Both llama models on Groq are free (no credit card).
 #
-# WHY llama-3.3-70b-versatile and NOT the smaller 8b-instant:
-# The deep-agent harness (planning tool, virtual filesystem, sub-agents, long
-# system prompt) needs a capable model to reason its way to a STOP condition.
-# The 8b model was too weak: it looped, re-calling tools without ever finishing,
-# and hit the graph recursion limit (~25 steps, minutes long). Counterintuitively
-# the loop made 8b burn ~15x MORE tokens than one clean 70b run -- so the bigger
-# model is both more reliable AND more token-efficient for this workload.
+# MODEL CHOICE — llama-3.1-8b-instant vs llama-3.3-70b-versatile:
+# Earlier this agent used two save tools and made the model thread a Postgres
+# uuid between them. That chaining was hard for a small model, so we ran on the
+# 70b model. Once the two tools were merged into ONE atomic screen_candidate
+# (the job id is now created and linked in Python — the model never handles it),
+# the model's job got much simpler: extract fields, score, and make a single
+# tool call. The 8b model handles that reliably, and — importantly for a free
+# account — it draws on a SEPARATE, larger daily token budget than the 70b model,
+# so it keeps working when the 70b daily cap is exhausted.
+#
+# To switch back to the higher-quality 70b (e.g. to record a polished demo when
+# its daily budget is fresh), just change the model string below to
+# "llama-3.3-70b-versatile". Nothing else needs to change.
 #
 # max_retries=1  -> when the per-minute token bucket is drained, fail fast with a
 #                   clear error instead of a long internal backoff.
@@ -399,7 +405,7 @@ from tools import (screen_candidate, list_pipeline,
 # Idempotency in screen_candidate (see tools.py) makes any retry safe:
 # a replayed run updates the existing rows, never inserts a duplicate.
 model = ChatGroq(
-    model="llama-3.3-70b-versatile",
+    model="llama-3.1-8b-instant",
     temperature=0,
     max_retries=1,
     request_timeout=30,
@@ -751,10 +757,11 @@ function parseRecommendation(text: string): "shortlist" | "maybe" | "reject" | n
 async function extractText(file: File): Promise<string> {
   if (file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf")) {
     const pdfjs = await import("pdfjs-dist");
-    // Worker must match the installed version; load it from a CDN so we don't
-    // have to wire a custom webpack/turbopack worker rule.
+    // Worker must match the INSTALLED version exactly. jsdelivr mirrors npm, so
+    // `pdfjs.version` always resolves to a real file here (cdnjs lags/renames
+    // releases, which silently breaks the worker and makes parsing throw).
     pdfjs.GlobalWorkerOptions.workerSrc =
-      `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjs.version}/pdf.worker.min.mjs`;
+      `https://cdn.jsdelivr.net/npm/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
     const buf = await file.arrayBuffer();
     const pdf = await pdfjs.getDocument({ data: buf }).promise;
     let out = "";
@@ -1142,6 +1149,8 @@ The 8b model wasn't capable enough to reliably reach that "done" state on this h
 Switching to the larger `llama-3.3-70b-versatile` (also free, no credit card on Groq) fixed it: the agent converges and returns in a few seconds.
 
 The counter-intuitive part — and the best line for your interview: **the bigger model was both more reliable *and* cheaper in tokens.** The 8b model's endless loop burned roughly **15× more tokens** than a single clean 70b run. "Use the smaller model to save money" was exactly backwards here. For an agentic harness, a model that finishes in one pass beats a cheap model that loops. Capability *is* efficiency.
+
+> **Update — why the code is back on `llama-3.1-8b-instant`.** That 8b failure happened with the *old two-tool design*, where the model had to save the job, then copy the returned Postgres uuid into a *second* tool call. Chaining plus threading an opaque id is exactly the kind of multi-step reasoning a small model loops on. After I merged the two tools into one atomic `screen_candidate` (the job id is created and linked in Python — the model never touches it), the model's job collapsed to *one* tool call. That's well within 8b's ability, and it converges cleanly. So the model choice isn't "8b is bad, 70b is good" — it's "**match the model to how hard you've made its job.**" I simplified the job, so I could drop back to the cheaper model, which also has a separate, larger free daily token budget. Flip the model string back to `llama-3.3-70b-versatile` any time you want the extra polish (e.g. recording the demo on a fresh 70b budget) — nothing else changes. *This is an even better interview beat than the original: the senior move wasn't buying a bigger model, it was redesigning the task so a smaller one suffices.*
 
 ### The guardrails I added so it fails loud, not silent
 
