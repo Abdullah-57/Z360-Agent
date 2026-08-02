@@ -385,19 +385,21 @@ from tools import (screen_candidate, list_pipeline,
 
 # The LLM "brain". Both llama models on Groq are free (no credit card).
 #
-# MODEL CHOICE — llama-3.1-8b-instant vs llama-3.3-70b-versatile:
-# Earlier this agent used two save tools and made the model thread a Postgres
-# uuid between them. That chaining was hard for a small model, so we ran on the
-# 70b model. Once the two tools were merged into ONE atomic screen_candidate
-# (the job id is now created and linked in Python — the model never handles it),
-# the model's job got much simpler: extract fields, score, and make a single
-# tool call. The 8b model handles that reliably, and — importantly for a free
-# account — it draws on a SEPARATE, larger daily token budget than the 70b model,
-# so it keeps working when the 70b daily cap is exhausted.
+# MODEL CHOICE — llama-3.3-70b-versatile (active) vs llama-3.1-8b-instant:
+# This agent runs on the 70b model for higher-quality reasoning and outreach
+# prose. Both are free on Groq (no credit card).
 #
-# To switch back to the higher-quality 70b (e.g. to record a polished demo when
-# its daily budget is fresh), just change the model string below to
-# "llama-3.3-70b-versatile". Nothing else needs to change.
+# The 8b model is a fully working fallback. Earlier the agent used two save tools
+# and made the model thread a Postgres uuid between them — chaining that a small
+# model looped on, so we needed 70b. After merging the two tools into ONE atomic
+# screen_candidate (the job id is created and linked in Python — the model never
+# handles it), the model's job collapsed to a single tool call, which 8b handles
+# reliably too. So the choice is now about output polish, not capability.
+#
+# WHEN TO SWITCH to "llama-3.1-8b-instant": the 70b free tier has a DAILY token
+# cap that heavy testing can exhaust (429 "TPD Limit"). The 8b model draws on a
+# SEPARATE, larger daily budget, so flip the model string below to keep working
+# when 70b's daily cap is hit. Nothing else needs to change.
 #
 # max_retries=1  -> when the per-minute token bucket is drained, fail fast with a
 #                   clear error instead of a long internal backoff.
@@ -405,7 +407,7 @@ from tools import (screen_candidate, list_pipeline,
 # Idempotency in screen_candidate (see tools.py) makes any retry safe:
 # a replayed run updates the existing rows, never inserts a duplicate.
 model = ChatGroq(
-    model="llama-3.1-8b-instant",
+    model="llama-3.3-70b-versatile",
     temperature=0,
     max_retries=1,
     request_timeout=30,
