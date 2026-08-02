@@ -205,7 +205,7 @@ Create a file `tools.py`. This holds the **custom tools** the agent can call and
 
 ```python
 # tools.py
-import os, json, uuid
+import os, json
 from typing import Union
 from supabase import create_client
 from langchain_core.tools import tool
@@ -216,33 +216,26 @@ supabase = create_client(
     os.environ["SUPABASE_SERVICE_KEY"],
 )
 
-def _resolve_job_id(job_id: str) -> str:
-    """Return a valid job_descriptions UUID, self-healing a bad one.
+def _resolve_job_id_for_pipeline(job_title: str = "") -> str:
+    """Find a job_descriptions id to summarize, WITHOUT trusting a model-supplied
+    UUID. The model was previously asked to thread the job_id UUID between tool
+    calls and got it wrong three different ways (placeholder "1" -> 22P02; a
+    copied example UUID -> 23503 FK violation; the literal string
+    "returned_job_id"). So we no longer accept a raw id from the model at all.
 
-    The id/job_id columns are Postgres `uuid`. The LLM is told to reuse the exact
-    id returned by save_job_description, but models sometimes pass a placeholder
-    like "1" instead of the real UUID. That makes Postgres reject the write with
-    `invalid input syntax for type uuid`. Rather than fail the whole screening
-    over the model's bookkeeping slip, we validate the id here: if it's already a
-    well-formed UUID we trust it; if not, we fall back to the most recently saved
-    job description (the one the agent almost certainly just created in this same
-    run). Raises a clear error only if there is no job to fall back to."""
-    try:
-        uuid.UUID(str(job_id))
-        return job_id  # already a valid UUID — use as-is
-    except (ValueError, AttributeError, TypeError):
-        pass
-    recent = (supabase.table("job_descriptions")
-              .select("id")
-              .order("created_at", desc=True)
-              .limit(1)
-              .execute())
-    if recent.data:
-        return recent.data[0]["id"]
+    Here we resolve by a human-readable job_title if one is given (case-insensitive
+    match on the most recent such job), otherwise fall back to the single most
+    recently saved job. Raises a clear error only if there is no job saved yet."""
+    q = supabase.table("job_descriptions").select("id,title").order(
+        "created_at", desc=True)
+    if job_title:
+        q = q.ilike("title", f"%{job_title}%")
+    res = q.limit(1).execute()
+    if res.data:
+        return res.data[0]["id"]
     raise ValueError(
-        f"job_id {job_id!r} is not a valid UUID and no saved job description "
-        "exists to fall back to. Call save_job_description first and reuse the "
-        "id it returns."
+        "No saved job description to summarize yet. Screen at least one "
+        "candidate first (which saves the job), then view the pipeline."
     )
 
 # The hiring company this agent screens for. Used to sign outreach emails so
@@ -264,26 +257,18 @@ Always explain WHY, citing specific resume evidence. Never invent facts
 that are not in the resume.
 """
 
-@tool
-def save_job_description(title: str, raw_text: str, parsed_json: str) -> str:
-    """Save a job description and its parsed requirements. parsed_json is a
-    JSON string with keys: must_have (list), nice_to_have (list),
-    min_years (number), domain (string). Returns the new job_id.
-
-    Idempotent: if a JD with the same title + raw_text already exists, the
-    existing row is UPDATED and its id returned instead of inserting a
-    duplicate. The deep-agent harness can call a tool more than once in a
-    single run, and the same JD may be submitted across test runs; matching on
-    (title, raw_text) keeps those from piling up duplicate rows."""
-    parsed = json.loads(parsed_json)
+def _upsert_job_description(title: str, raw_text: str, parsed: dict) -> str:
+    """Insert-or-update a job description, returning its id. Idempotent on
+    (title, raw_text) so re-screening against the same JD doesn't pile up
+    duplicate rows. Kept as a plain helper (not a @tool) because the model no
+    longer calls it directly -- screen_candidate calls it in Python, so the
+    returned uuid never has to pass through the model."""
     payload = {"title": title, "raw_text": raw_text, "parsed": parsed}
-
     existing = (supabase.table("job_descriptions")
                 .select("id")
                 .eq("title", title)
                 .eq("raw_text", raw_text)
                 .execute())
-
     if existing.data:
         row_id = existing.data[0]["id"]
         res = (supabase.table("job_descriptions")
@@ -292,54 +277,68 @@ def save_job_description(title: str, raw_text: str, parsed_json: str) -> str:
                .execute())
     else:
         res = supabase.table("job_descriptions").insert(payload).execute()
-
     return res.data[0]["id"]
 
+
 @tool
-def save_candidate_result(job_id: str, name: str, resume_text: str,
-                          score: Union[int, str], recommendation: str,
-                          analysis_json: str, outreach_email: str) -> str:
-    """Save one screened candidate's result. analysis_json is a JSON string
-    with keys: strengths (list), gaps (list), requirement_matches (list of
-    {requirement, met, evidence}). Returns the candidate_id.
+def screen_candidate(job_title: str, job_raw_text: str, job_parsed_json: str,
+                     name: str, resume_text: str, score: Union[int, str],
+                     recommendation: str, analysis_json: str,
+                     outreach_email: str) -> str:
+    """Save a job description AND one screened candidate against it in a single
+    atomic step. Returns the candidate_id.
 
-    Idempotent: if this candidate (same job_id + name) was already screened,
-    the existing row is UPDATED in place instead of inserting a duplicate.
-    This keeps a retried/replayed agent step from creating multiple rows.
-    NOTE: matching on name is fine for a demo; in production you'd match on a
-    stable identifier (email or candidate id) to avoid same-name collisions."""
-    # Guard the foreign key: if the model handed us a placeholder instead of the
-    # real UUID from save_job_description, resolve it (see _resolve_job_id) so a
-    # good screening isn't lost to a bad id.
-    job_id = _resolve_job_id(job_id)
+    Pass the JOB fields and the CANDIDATE fields together:
+      - job_title: a short title for the role (e.g. "Backend Engineer").
+      - job_raw_text: the original job-description text.
+      - job_parsed_json: JSON string with keys must_have (list), nice_to_have
+        (list), min_years (number), domain (string).
+      - name, resume_text: the candidate.
+      - score (0-100), recommendation ('shortlist'|'maybe'|'reject').
+      - analysis_json: JSON string with keys strengths (list), gaps (list),
+        requirement_matches (list of {requirement, met, evidence}).
+      - outreach_email: 2-3 sentence email, ONLY if recommendation is
+        'shortlist', else empty string.
 
-    # LLMs often serialize numbers as strings (e.g. "90" instead of 90). We
-    # accept either and coerce to int here so a well-reasoned screening isn't
-    # thrown away over a JSON type mismatch. int() also strips a stray "90.0".
+    WHY one tool instead of two: the job_id is a Postgres uuid. Earlier the
+    model had to call one tool to save the JD, then copy the returned uuid into a
+    second tool -- and it corrupted that uuid three different ways (a placeholder
+    "1", a made-up uuid, and the literal text "returned_job_id"). Here the uuid
+    is created and linked entirely in Python; the model never sees or handles it,
+    so that whole class of bug is impossible.
+
+    Idempotent on both sides: re-screening the same JD updates its row (matched
+    on title+raw_text); re-screening the same candidate for that job updates the
+    candidate row (matched on job_id+name) instead of inserting duplicates."""
+    # 1. Save/get the job first, in Python -- this yields a real, existing uuid.
+    parsed = json.loads(job_parsed_json)
+    job_id = _upsert_job_description(job_title, job_raw_text, parsed)
+
+    # 2. LLMs often serialize numbers as strings (e.g. "90"); accept either and
+    # coerce so a well-reasoned screening isn't thrown away over a type mismatch.
+    # int(float(...)) also strips a stray "90.0".
     score = int(float(score))
 
-    # Models habitually sign emails with a "[Your Name]" placeholder even when
-    # told not to. Rather than trust the prompt alone, we swap any leftover
-    # placeholder for the real company name here so no email is ever stored (or
-    # sent) with an unfilled blank. Covers the common variants.
+    # 3. Models habitually sign emails with a "[Your Name]" placeholder even when
+    # told not to. Swap any leftover placeholder for the real company name so no
+    # email is ever stored with an unfilled blank. Covers the common variants.
     if outreach_email:
         for placeholder in ("[Your Name]", "[Your name]", "[your name]",
                             "[Company Name]", "[Company]", "[Name]"):
             outreach_email = outreach_email.replace(placeholder, COMPANY_NAME)
 
+    # 4. Upsert the candidate against the job_id we just created.
     analysis = json.loads(analysis_json)
     payload = {
         "job_id": job_id, "name": name, "resume_text": resume_text,
         "score": score, "recommendation": recommendation,
         "analysis": analysis, "outreach_email": outreach_email,
     }
-
     existing = (supabase.table("candidates")
                 .select("id")
                 .eq("job_id", job_id)
                 .eq("name", name)
                 .execute())
-
     if existing.data:
         row_id = existing.data[0]["id"]
         res = (supabase.table("candidates")
@@ -348,15 +347,17 @@ def save_candidate_result(job_id: str, name: str, resume_text: str,
                .execute())
     else:
         res = supabase.table("candidates").insert(payload).execute()
-
     return res.data[0]["id"]
 
 @tool
-def list_pipeline(job_id: str) -> str:
+def list_pipeline(job_title: str = "") -> str:
     """Return all screened candidates for a job, ranked by score (highest
-    first), as a JSON string. Use this to summarize the hiring pipeline."""
-    # Same UUID guard as save_candidate_result: tolerate a placeholder job_id.
-    job_id = _resolve_job_id(job_id)
+    first), as a JSON string. Use this to summarize the hiring pipeline.
+
+    Pass job_title (a human-readable title like "Backend Engineer") to pick the
+    job, or leave it empty to use the most recently screened job. Do NOT pass a
+    uuid -- the tool resolves the job itself, so the model never handles ids."""
+    job_id = _resolve_job_id_for_pipeline(job_title)
     res = (supabase.table("candidates")
            .select("name,score,recommendation")
            .eq("job_id", job_id)
@@ -365,7 +366,7 @@ def list_pipeline(job_id: str) -> str:
     return json.dumps(res.data)
 ```
 
-> These three tools (`save_job_description`, `save_candidate_result`, `list_pipeline`) plus the rubric are your "domain knowledge + at least a couple of custom tools" requirement — comfortably met.
+> These two tools (`screen_candidate`, `list_pipeline`) plus the rubric are your "domain knowledge + at least a couple of custom tools" requirement — comfortably met. `screen_candidate` deliberately does the JD-save and candidate-save in one atomic call so the job's uuid is created and linked in Python and never has to be threaded back through the model (which is what kept corrupting it). The private `_upsert_job_description` helper below keeps that save logic tidy.
 
 ### 3.4 The Deep Agent itself (`agent.py`)
 
@@ -379,8 +380,8 @@ load_dotenv()  # reads your .env when running locally
 
 from deepagents import create_deep_agent
 from langchain_groq import ChatGroq
-from tools import (save_job_description, save_candidate_result,
-                   list_pipeline, SCORING_RUBRIC, COMPANY_NAME)
+from tools import (screen_candidate, list_pipeline,
+                   SCORING_RUBRIC, COMPANY_NAME)
 
 # The LLM "brain". Both llama models on Groq are free (no credit card).
 #
@@ -395,8 +396,8 @@ from tools import (save_job_description, save_candidate_result,
 # max_retries=1  -> when the per-minute token bucket is drained, fail fast with a
 #                   clear error instead of a long internal backoff.
 # request_timeout -> hard ceiling on any single LLM call so it can't block forever.
-# Idempotency in save_candidate_result (see tools.py) makes any retry safe:
-# a replayed run updates the existing row, never inserts a duplicate.
+# Idempotency in screen_candidate (see tools.py) makes any retry safe:
+# a replayed run updates the existing rows, never inserts a duplicate.
 model = ChatGroq(
     model="llama-3.3-70b-versatile",
     temperature=0,
@@ -410,15 +411,20 @@ Your job: screen candidates against a job description fairly, consistently,
 and with evidence. You reduce bias by scoring only on job-relevant criteria.
 
 WORKFLOW you must follow:
-1. When given a job description, extract structured requirements
-   (must_have skills, nice_to_have skills, min_years, domain), then call
-   save_job_description to persist it. Keep the returned job_id.
+1. When given a job description, extract structured requirements:
+   must_have skills, nice_to_have skills, min_years, domain. Also pick a short
+   job_title (e.g. "Backend Engineer") from the description.
 2. For EACH resume provided, score it using the rubric below, decide a
-   recommendation, write a 2-3 sentence personalized outreach email ONLY if
-   the recommendation is 'shortlist', and call save_candidate_result.
+   recommendation, and write a 2-3 sentence personalized outreach email ONLY if
+   the recommendation is 'shortlist'. Then call screen_candidate ONCE, passing
+   BOTH the job fields (job_title, job_raw_text, job_parsed_json) AND the
+   candidate fields (name, resume_text, score, recommendation, analysis_json,
+   outreach_email) together. This single tool saves the job and the candidate
+   atomically and links them for you — you never handle a job id yourself.
    Sign every outreach email as "{COMPANY_NAME}" — never use a placeholder
    like "[Your Name]".
-3. When asked, call list_pipeline to give a ranked summary of all candidates.
+3. When asked for the pipeline, call list_pipeline. Pass the job_title to pick
+   the role, or leave it empty for the most recent job. Never pass an id.
 
 {SCORING_RUBRIC}
 
@@ -431,7 +437,7 @@ Rules:
 # Build the deep agent (this is the LangGraph harness under the hood)
 agent = create_deep_agent(
     model=model,
-    tools=[save_job_description, save_candidate_result, list_pipeline],
+    tools=[screen_candidate, list_pipeline],
     system_prompt=SYSTEM_PROMPT,
 )
 ```
@@ -705,7 +711,13 @@ Use *your* FastAPI Cloud service URL from step 3.8, with no trailing slash. `NEX
 
 ### 4.4 Build the screening page
 
-Replace the contents of `src/app/page.tsx` with the code below. This is a simple, polished single-screen interface: paste a JD, paste a resume, click **Screen candidate**, see the agent's result.
+Replace the contents of `src/app/page.tsx` with the code below. This is a polished interface with two tabs. The **Screen candidate** tab lets you paste (or upload) a JD and resume, then shows the agent's result with a color-coded score badge and progress bar. The **Pipeline** tab calls the agent's `list_pipeline` tool to show all screened candidates ranked by score.
+
+> Three "go beyond" features are built into this page (see section 5): a **pipeline view**, a **visual score** (badge + bar), and **resume file upload** (`.txt`/`.pdf`). PDF text is parsed in the browser, so no file ever leaves the user's machine and no extra key is needed. First install the PDF parser (inside `z360-frontend`):
+>
+> ```bash
+> npm install pdfjs-dist
+> ```
 
 ```tsx
 "use client";
@@ -713,13 +725,98 @@ Replace the contents of `src/app/page.tsx` with the code below. This is a simple
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import { Input } from "@/components/ui/input";
+import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+
+const AGENT_URL = process.env.NEXT_PUBLIC_AGENT_URL;
+
+// Pull a 0–100 score and a recommendation out of the agent's free-text reply so
+// we can render them visually. The agent isn't guaranteed to phrase these the
+// same way every time, so we match loosely and fail soft (null = just show text).
+function parseScore(text: string): number | null {
+  const m = text.match(/(\d{1,3})\s*(?:\/|out of)\s*100/i);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  return n >= 0 && n <= 100 ? n : null;
+}
+function parseRecommendation(text: string): "shortlist" | "maybe" | "reject" | null {
+  const m = text.match(/\b(shortlist|maybe|reject)\b/i);
+  return m ? (m[1].toLowerCase() as "shortlist" | "maybe" | "reject") : null;
+}
+
+// Extract plain text from an uploaded resume. .txt is read directly; .pdf is
+// parsed in the browser with pdfjs (no server upload, no key needed).
+async function extractText(file: File): Promise<string> {
+  if (file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf")) {
+    const pdfjs = await import("pdfjs-dist");
+    // Worker must match the installed version; load it from a CDN so we don't
+    // have to wire a custom webpack/turbopack worker rule.
+    pdfjs.GlobalWorkerOptions.workerSrc =
+      `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjs.version}/pdf.worker.min.mjs`;
+    const buf = await file.arrayBuffer();
+    const pdf = await pdfjs.getDocument({ data: buf }).promise;
+    let out = "";
+    for (let p = 1; p <= pdf.numPages; p++) {
+      const page = await pdf.getPage(p);
+      const content = await page.getTextContent();
+      out += content.items.map((i: any) => i.str).join(" ") + "\n";
+    }
+    return out.trim();
+  }
+  return (await file.text()).trim();
+}
 
 export default function Home() {
+  // --- Screen tab state ---
   const [jd, setJd] = useState("");
   const [resume, setResume] = useState("");
   const [reply, setReply] = useState("");
   const [loading, setLoading] = useState(false);
+  const [uploadNote, setUploadNote] = useState("");
+
+  // --- Pipeline tab state ---
+  const [pipelineJob, setPipelineJob] = useState("");
+  const [pipelineReply, setPipelineReply] = useState("");
+  const [pipelineLoading, setPipelineLoading] = useState(false);
+
+  const score = reply ? parseScore(reply) : null;
+  const rec = reply ? parseRecommendation(reply) : null;
+  const recColor =
+    rec === "shortlist" ? "bg-green-600" : rec === "maybe" ? "bg-amber-500" : "bg-red-600";
+  const barColor =
+    score === null ? "bg-gray-400" : score >= 75 ? "bg-green-600" : score >= 50 ? "bg-amber-500" : "bg-red-600";
+
+  async function callAgent(message: string): Promise<string> {
+    const res = await fetch(`${AGENT_URL}/screen`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      return `Error ${res.status}: ${data.detail ?? "Unknown error from agent."}`;
+    }
+    return data.reply ?? "No response.";
+  }
+
+  async function onFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploadNote(`Reading ${file.name}…`);
+    try {
+      const text = await extractText(file);
+      if (!text) {
+        setUploadNote(`Couldn't read any text from ${file.name}. Try pasting instead.`);
+        return;
+      }
+      setResume(text);
+      setUploadNote(`Loaded ${file.name}.`);
+    } catch {
+      setUploadNote(`Couldn't parse ${file.name}. Paste the text instead.`);
+    }
+  }
 
   async function screen() {
     setLoading(true);
@@ -730,24 +827,27 @@ export default function Home() {
       `Screen this candidate: save the job if new, score the candidate, ` +
       `and give me the result.`;
     try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_AGENT_URL}/screen`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        // The backend puts the real reason in `detail` (e.g. a Groq rate-limit
-        // message on 429, or the exception text on 500). Surface it instead of
-        // silently showing "No response."
-        setReply(`Error ${res.status}: ${data.detail ?? "Unknown error from agent."}`);
-      } else {
-        setReply(data.reply ?? "No response.");
-      }
-    } catch (e) {
+      setReply(await callAgent(message));
+    } catch {
       setReply("Error reaching the agent. It may be waking up — try again in a moment.");
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function showPipeline() {
+    setPipelineLoading(true);
+    setPipelineReply("");
+    const message =
+      `Show me the ranked pipeline of all screened candidates` +
+      (pipelineJob ? ` for the "${pipelineJob}" job` : ` for the most recent job`) +
+      `. Use the list_pipeline tool and present them ranked by score, highest first.`;
+    try {
+      setPipelineReply(await callAgent(message));
+    } catch {
+      setPipelineReply("Error reaching the agent. Try again in a moment.");
+    } finally {
+      setPipelineLoading(false);
     }
   }
 
@@ -761,34 +861,88 @@ export default function Home() {
         </p>
       </div>
 
-      <Card>
-        <CardHeader><CardTitle>Job description</CardTitle></CardHeader>
-        <CardContent>
-          <Textarea rows={5} value={jd} onChange={(e) => setJd(e.target.value)}
-            placeholder="Paste the job description..." />
-        </CardContent>
-      </Card>
+      <Tabs defaultValue="screen">
+        <TabsList>
+          <TabsTrigger value="screen">Screen candidate</TabsTrigger>
+          <TabsTrigger value="pipeline">Pipeline</TabsTrigger>
+        </TabsList>
 
-      <Card>
-        <CardHeader><CardTitle>Candidate resume</CardTitle></CardHeader>
-        <CardContent>
-          <Textarea rows={7} value={resume} onChange={(e) => setResume(e.target.value)}
-            placeholder="Paste the candidate's resume..." />
-        </CardContent>
-      </Card>
+        {/* --- SCREEN TAB --- */}
+        <TabsContent value="screen" className="space-y-6">
+          <Card>
+            <CardHeader><CardTitle>Job description</CardTitle></CardHeader>
+            <CardContent>
+              <Textarea rows={5} value={jd} onChange={(e) => setJd(e.target.value)}
+                placeholder="Paste the job description..." />
+            </CardContent>
+          </Card>
 
-      <Button onClick={screen} disabled={loading || !jd || !resume}>
-        {loading ? "Screening..." : "Screen candidate"}
-      </Button>
+          <Card>
+            <CardHeader><CardTitle>Candidate resume</CardTitle></CardHeader>
+            <CardContent className="space-y-3">
+              <div className="flex items-center gap-3">
+                <Input type="file" accept=".txt,.pdf" onChange={onFile} className="max-w-xs" />
+                {uploadNote && <span className="text-sm text-muted-foreground">{uploadNote}</span>}
+              </div>
+              <Textarea rows={7} value={resume} onChange={(e) => setResume(e.target.value)}
+                placeholder="Paste the candidate's resume, or upload a .txt/.pdf above..." />
+            </CardContent>
+          </Card>
 
-      {reply && (
-        <Card>
-          <CardHeader><CardTitle>Result</CardTitle></CardHeader>
-          <CardContent>
-            <pre className="whitespace-pre-wrap text-sm">{reply}</pre>
-          </CardContent>
-        </Card>
-      )}
+          <Button onClick={screen} disabled={loading || !jd || !resume}>
+            {loading ? "Screening..." : "Screen candidate"}
+          </Button>
+
+          {reply && (
+            <Card>
+              <CardHeader><CardTitle>Result</CardTitle></CardHeader>
+              <CardContent className="space-y-4">
+                {(score !== null || rec) && (
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-3">
+                      {score !== null && <span className="text-3xl font-bold">{score}<span className="text-base text-muted-foreground">/100</span></span>}
+                      {rec && <Badge className={`${recColor} text-white capitalize`}>{rec}</Badge>}
+                    </div>
+                    {score !== null && (
+                      <div className="h-2 w-full rounded bg-muted">
+                        <div className={`h-2 rounded ${barColor}`} style={{ width: `${score}%` }} />
+                      </div>
+                    )}
+                  </div>
+                )}
+                <pre className="whitespace-pre-wrap text-sm">{reply}</pre>
+              </CardContent>
+            </Card>
+          )}
+        </TabsContent>
+
+        {/* --- PIPELINE TAB --- */}
+        <TabsContent value="pipeline" className="space-y-6">
+          <Card>
+            <CardHeader><CardTitle>Ranked pipeline</CardTitle></CardHeader>
+            <CardContent className="space-y-3">
+              <p className="text-sm text-muted-foreground">
+                Screen a few candidates first, then view them ranked by score. Leave
+                the box blank to use your most recent job.
+              </p>
+              <Input value={pipelineJob} onChange={(e) => setPipelineJob(e.target.value)}
+                placeholder="Job title (optional, e.g. Backend Engineer)" className="max-w-sm" />
+              <Button onClick={showPipeline} disabled={pipelineLoading}>
+                {pipelineLoading ? "Loading..." : "Show pipeline"}
+              </Button>
+            </CardContent>
+          </Card>
+
+          {pipelineReply && (
+            <Card>
+              <CardHeader><CardTitle>Pipeline</CardTitle></CardHeader>
+              <CardContent>
+                <pre className="whitespace-pre-wrap text-sm">{pipelineReply}</pre>
+              </CardContent>
+            </Card>
+          )}
+        </TabsContent>
+      </Tabs>
     </main>
   );
 }
@@ -796,13 +950,19 @@ export default function Home() {
 
 ### 4.5 Test the frontend locally
 
+Make sure you installed the PDF parser first (`npm install pdfjs-dist`), then:
+
 ```bash
 npm run dev
 ```
 
-Open `http://localhost:3000`. Paste a short JD and a resume, click **Screen candidate**. If your FastAPI Cloud service is up, you'll get a scored result back in a few seconds. Check Supabase — a new candidate row should appear.
+Open `http://localhost:3000` and check all three features:
 
-> If nothing happens: open the browser console (F12 → Console) for errors. The usual causes are a wrong `NEXT_PUBLIC_AGENT_URL` (trailing slash, typo) or the backend still waking from a cold start (wait ~30s and retry).
+1. **Screen + visual score.** Paste a short JD and a resume, click **Screen candidate**. In a few seconds you get the result with a big score number, a colored badge (shortlist/maybe/reject), and a progress bar. Check Supabase — a new candidate row should appear.
+2. **File upload.** Click the file picker above the resume box and choose a `.txt` or `.pdf` resume. The text should populate the box; then screen as normal.
+3. **Pipeline.** Screen a second, weaker candidate against the same JD. Switch to the **Pipeline** tab and click **Show pipeline** — both candidates should come back ranked by score, highest first.
+
+> If nothing happens: open the browser console (F12 → Console) for errors. The usual causes are a wrong `NEXT_PUBLIC_AGENT_URL` (trailing slash, typo) or the backend still waking from a cold start (wait ~30s and retry). Groq's free tier also has a daily token cap — if you screened a lot while testing and start getting `Error 429`, wait for the daily reset.
 
 ### 4.6 Deploy the frontend to Vercel
 
@@ -829,19 +989,20 @@ git push -u origin main
 
 ## 5. Go beyond the spec (to impress, not just pass)
 
-You now meet every requirement. If you have extra hours, add one or two of these — each is small but signals product judgment. Do NOT add all of them; the brief explicitly rewards tight scope. Pick the pipeline view plus one more.
+You now meet every requirement. The `page.tsx` in section 4.4 already ships **three** "go beyond" features, chosen because each signals product judgment without ballooning scope:
 
-1. **Pipeline view (highest value, low effort).** Add a second tab that lets the user type a job title/ID and calls the agent with "Show me the ranked pipeline for this job." The agent uses your `list_pipeline` tool. Now you can screen 3–4 candidates on camera and show them ranked — a great demo moment that proves the workflow, not just single-shot chat.
+1. **Pipeline view (highest value).** The **Pipeline** tab calls the agent with "Show me the ranked pipeline…", which triggers your `list_pipeline` tool. Screen 3–4 candidates, then show them ranked on camera — a great demo moment that proves the whole workflow, not just single-shot chat.
 
-2. **Show the score visually.** Parse a score out of the reply and render a shadcn `Badge` (green shortlist / amber maybe / red reject) and a simple progress bar. Small touch, looks polished on video.
+2. **Visual score.** The result card parses the score and recommendation out of the agent's reply and renders a big number, a color-coded shadcn `Badge` (green shortlist / amber maybe / red reject), and a progress bar. It fails soft: if it can't find a score, it just shows the text. Looks polished on video.
 
-3. **Bias-safe framing.** Add one line to the system prompt: "Ignore name, gender, age, and photos; score only job-relevant evidence." Then say in your video that you deliberately designed the agent to reduce screening bias. Reviewers who hire for a living notice this.
+3. **Resume file upload.** The resume box accepts a `.txt` or `.pdf` upload. PDF text is extracted **in the browser** with `pdfjs-dist`, so no file ever leaves the user's machine and no extra key or backend route is needed. Paste still works as before.
 
-4. **Resume file upload.** Accept a `.txt`/`.pdf` upload instead of paste. (PDF parsing adds complexity — only if time allows.)
+Ideas deliberately left out (good things to *mention* in your video as "what I'd do next"):
 
-5. **Streaming responses.** Stream the agent's output token-by-token for a snappier feel. Nice-to-have, not essential.
+- **Bias-safe framing.** One line in the system prompt: "Ignore name, gender, age, and photos; score only job-relevant evidence." (Cheap to add if you want a fourth — it's a prompt-only change in `agent.py`.)
+- **Streaming responses.** Token-by-token output for a snappier feel. Nice-to-have, not essential.
 
-> Interview-ready framing: when you add a feature, be ready to say *why you stopped where you did*. "I scoped to single-JD screening with a pipeline view because the brief rewards one workflow done well; multi-role support was my next step." That sentence is worth real points under "engineering ownership."
+> Interview-ready framing: be ready to say *why you stopped where you did*. "I added a pipeline view, a visual score, and file upload because each proves a different capability — multi-candidate workflow, output parsing, and input flexibility — without adding a second backend surface. Auth, RLS, and multi-role pipelines were my next steps." That sentence is worth real points under "engineering ownership." The honest tradeoff to know: three features done cleanly beats five done roughly — reviewers who hire notice polish over feature-count.
 
 ---
 
@@ -853,7 +1014,7 @@ Follow this exact structure and timing — reviewers scan for these beats:
 
 - **0:00–0:30 — The problem.** "Recruiters waste hours manually screening resumes against a JD, and it's inconsistent and biased. I built a Candidate Screening Deep Agent that does it in seconds with an auditable rubric."
 - **0:30–2:00 — Live demo.** Open your Vercel URL. Paste a real JD. Screen two contrasting candidates (one strong, one weak). Read out the score, the evidence-based reasoning, and the drafted outreach for the strong one. Then show the ranked pipeline view.
-- **2:00–3:30 — Harness design.** Show `agent.py` and `tools.py` in your editor. Explain: "It's a LangGraph deep agent from the `deepagents` library. It has domain knowledge — this scoring rubric — and three custom tools that parse the JD, persist scored candidates to Supabase, and rank the pipeline. The system prompt enforces a fixed workflow, so it's a real harness, not a chatbot." Show a row appearing in Supabase.
+- **2:00–3:30 — Harness design.** Show `agent.py` and `tools.py` in your editor. Explain: "It's a LangGraph deep agent from the `deepagents` library. It has domain knowledge — this scoring rubric — and custom tools: `screen_candidate` saves the job and the scored candidate to Supabase atomically, and `list_pipeline` ranks them. The system prompt enforces a fixed workflow, so it's a real harness, not a chatbot." (Optional strong detail: "I merged the two saves into one atomic tool so the database id never has to be threaded back through the model — that made a whole class of foreign-key bug impossible.") Show a row appearing in Supabase.
 - **3:30–4:30 — Architecture & tradeoffs.** Show the diagram (from section 0). "Frontend on Vercel, Python agent on FastAPI Cloud, Supabase for persistence. I kept the DB key server-side only. Known limitations: free-tier cold starts, no auth/RLS yet. With more time I'd add authentication, RLS, and multi-role pipelines."
 
 Speak clearly, keep it moving, and make sure the live product is actually working before you hit record (wake the backend first by hitting `/health`).
@@ -882,7 +1043,7 @@ whole pipeline.
 ## How the harness is designed
 A LangGraph Deep Agent (LangChain `deepagents`) with:
 - **Domain knowledge:** a weighted scoring rubric baked into the system prompt.
-- **Custom tools:** save_job_description, save_candidate_result, list_pipeline.
+- **Custom tools:** screen_candidate (atomic JD-save + candidate-save), list_pipeline.
 - **Workflow:** parse JD → score each resume → persist → rank pipeline.
 The agent plans and calls tools autonomously rather than just replying in text.
 
@@ -989,7 +1150,7 @@ A hang is the worst failure mode — you can't tell if it's working. So I made f
 - `recursion_limit=15` on `agent.invoke` — caps the loop so a bad run ends in seconds, not minutes.
 - `request_timeout=30` and `max_retries=1` on `ChatGroq` — no single call can block forever, and a drained rate limit fails fast instead of silently backing off.
 - `try/except` in `/screen` mapping `RateLimitError` → **429** and `GraphRecursionError` → **422**, so the caller gets an actionable status code instead of a hung socket or an opaque 500.
-- Idempotency in `save_candidate_result` (match on `job_id + name`, then UPDATE-or-INSERT) — so a retried or replayed run never creates duplicate rows.
+- Idempotency in `screen_candidate` (JD matched on `title + raw_text`, candidate matched on `job_id + name`, each UPDATE-or-INSERT) — so a retried or replayed run never creates duplicate rows.
 
 > If you only remember one thing for the interview: *"I had a silent hang. I isolated each layer with a timing script, found the deep-agent loop was the culprit, root-caused it to an under-powered model hitting the recursion limit, and fixed it by moving to a stronger model — which was actually cheaper in tokens because it stopped looping. Then I added a recursion cap, timeouts, and typed error responses so the failure mode is loud instead of silent."* That single paragraph demonstrates debugging methodology, systems understanding, and production instincts all at once.
 
