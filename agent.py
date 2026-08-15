@@ -32,7 +32,7 @@ from tools import (screen_candidate, list_pipeline,
 # Idempotency in screen_candidate (see tools.py) makes any retry safe:
 # a replayed run updates the existing rows, never inserts a duplicate.
 model = ChatGroq(
-    model="llama-3.3-70b-versatile",
+    model="openai/gpt-oss-20b",
     temperature=0,
     max_retries=1,
     request_timeout=30,
